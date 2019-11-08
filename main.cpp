@@ -1,16 +1,16 @@
+// Inverse kinematics using pseudo-inverse of Jacobian matrix
+
+// Link with libcugl libglut32 libopengl32 libglu32
+
 #include <iostream>
-#include <string>
 #include <vector>
-#include <glew.h>
-#include <GLFW/glfw3.h>
+#include "include/cugl.h"
 #include "GLUT/GL/glut.h"
-#include "GLM/glm/matrix.hpp"
-#include "GLM/glm/gtc/matrix_transform.hpp"
-#include "cugl.h"
 
-using namespace cugl;
 using namespace std;
+using namespace cugl;
 
+// Current window dimensions
 int windowWidth = 800;
 int windowHeight = 800;
 
@@ -25,7 +25,7 @@ GLfloat dir[] = { 0.0, 0.0, 1.0, 0.0 };
 class Link
 {
 public:
-    Link(double length, double radius, GLfloat *col) : length(length), radius(radius), col(col)
+    Link(double length, GLfloat *col) : length(length), radius(length/20), col(col)
     {
         bar = gluNewQuadric();
         gluQuadricDrawStyle(bar, GLU_FILL);
@@ -36,7 +36,7 @@ public:
     void draw()
     {
         glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, col);
-        ori.apply();
+        glRotated(degrees(angle), 1, 0, 0);
         gluCylinder(bar, radius, radius, length, 20, 20);
         glTranslated(0, 0, length);
         glutSolidSphere(1.5 * radius, 20, 20);
@@ -53,56 +53,66 @@ public:
         pLinks.push_back(p);
     }
 
-    void setRot(Quaternion newOri)
+    void setRot(double newAngle)
     {
-        ori = newOri;
-    }
-
-    double getLength()
-    {
-        return length;
+        angle = newAngle;
     }
 
 private:
     double length;
     double radius;
     GLfloat *col;
-    Quaternion ori;
+    double angle;
     vector<Link*> pLinks;
     GLUquadricObj *bar;
 };
 
-Link *top_link;
-Link *middle_link;
-Link* bottom_link;
+// The arm has three components
+Link *upper;
+const double L = 25;
+double theta = -PI/4;
 
-double init_x;
-double init_y;
-double final_x = -10; //final x position of the tip
-double final_y = -15; //final y position of the tip
-double curr_x; //the current position of the tip
-double curr_y; //the current position of the tip
+Link *middle;
+const double M = 15;
+double phi = -PI/4;
 
-void build()
+Link *lower;
+const double S = 10;
+double psi = -PI/4;
+
+// Target point - moved when the arm has reached it
+double tX = L;
+double tY = S;
+
+// Current position of tip
+double x;
+double y;
+
+// Control step size
+double step = 0.01;
+
+// Points passed through on this trip
+vector<Point> points;
+
+// Choose a random target for the tip to aim at
+void chooseTarget()
 {
-    top_link = new Link(10, 1.5, red);
-    top_link->setRot(Quaternion(J, 0));
-    middle_link = new Link(7.5, 0.75, green);
-    middle_link->setRot(Quaternion(J, 0));
-    top_link->addLink(middle_link);
-    bottom_link = new Link(5, 0.25, blue);
-    bottom_link->setRot(Quaternion(J, 0));
-    middle_link->addLink(bottom_link);
+    double rad = 0, ang = 2 * PI * randReal();
+    rad = 2 + (L + M + S - 3) * randReal();
+    tX = rad * cos(ang);
+    tY = rad * sin(ang);
+    points.clear();
+}
 
-    //we need to calculate the initial position of the tip (x and y coordinates) using the formulas:
-    // x = Acos(alpha) + Bcos(alpha + beta) + Ccos(alpha + beta + gamma)
-    // y = Asin(alpha) + Bsin(alpha + beta) + Csin(alpha + beta + gamma)
-
-    //the initial angles are all 90
-    init_x = 0;
-    init_y = top_link->getLength() + middle_link->getLength() + bottom_link->getLength();
-    curr_x = init_x;
-    curr_y = init_y;
+// Initialize arm and target
+void initialize()
+{
+    upper = new Link(L, red);
+    middle = new Link(M, green);
+    lower = new Link(S, blue);
+    upper->addLink(middle);
+    middle->addLink(lower);
+    chooseTarget();
 }
 
 void display (void)
@@ -110,162 +120,166 @@ void display (void)
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
-    glTranslated(-15, -10, -100);
-    glRotated(-90, 1, 0, 0);
+    glTranslated(0, 0, -150);
+    glRotated(90, 0, 1, 0);
 
+    // Show target
+    glPushMatrix();
+    glMaterialfv(GL_FRONT, GL_AMBIENT_AND_DIFFUSE, blue);
+    glTranslated(0, -tY, tX);
+    glutSolidSphere(1, 20, 20);
+    glPopMatrix();
 
+    // Record point and show trail
+    points.push_back(Point(0, -y, x));
+    glDisable(GL_LIGHTING);
+    glColor3d(1, 1, 1);
+    glBegin(GL_POINTS);
+    for (vector<Point>::const_iterator i = points.begin(); i != points.end(); ++i)
+        i->draw();
+    glEnd();
+    glEnable(GL_LIGHTING);
+
+    // Draw robot arm
     glutSolidSphere(3, 20, 20);
-    top_link->draw();
+    upper->draw();
 
     glutSwapBuffers();
 }
 
-Quaternion upperQuat = Quaternion(J, 0);
-Quaternion middleQuat = Quaternion(J, 0);
-Quaternion lowerQuat = Quaternion(J, 0);
-
-double sp = 0.0008;
-
 void idle()
 {
-    //if we are at the final position no need to move anything
-    if(abs(final_x - curr_x) < 0.0001 && abs(final_y - curr_y) < 0.0001)
-        return;
+    static double oldDTheta = 0;
+    static double oldDPhi = 0;
+    static double oldDPsi = 0;
 
-    //we have to recalculate the jacobian (J) everytime
-    //J is a 3x2 matrix
-    //we take partial derivatives of
-    // x = Acos(alpha) + Bcos(alpha + beta) + Ccos(alpha + beta + gamma)
-    // y = Asin(alpha) + Bsin(alpha + beta) + Csin(alpha + beta + gamma)
-    // J[0][0] = -Asin(alpha) - Bsin(alpha + beta) - Csin(alpha + beta + gamma)
-    // J[1][0] = -Bsin(alpha + beta) - Csin(alpha + beta + gamma)
-    // J[2][0] = -Csin(alpha + beta + gamma)
-    // J[0][1] = Acos(alpha) + Bcos(alpha + beta) + Ccos(alpha + beta + gamma)
-    // J[1][1] = Bcos(alpha + beta) + Ccos(alpha + beta + gamma)
-    // J[2][1] = Ccos(alpha + beta + gamma)
+    // Current position of tip
+    x = L * cos(theta) + M * cos(theta + phi) + S * cos(theta + phi + psi);
+    y = L * sin(theta) + M * sin(theta + phi) + S * sin(theta + phi + psi);
 
-    double Jacobian[3][2];
-    Jacobian[0][0] = -top_link->getLength()*sin(upperQuat.angle())
-                     -middle_link->getLength()*sin(upperQuat.angle() + middleQuat.angle())
-                     -bottom_link->getLength()*sin(upperQuat.angle() + middleQuat.angle() + lowerQuat.angle());
-    Jacobian[1][0] = -middle_link->getLength()*sin(upperQuat.angle() + middleQuat.angle())
-                     -bottom_link->getLength()*sin(upperQuat.angle() + middleQuat.angle() + lowerQuat.angle());
-    Jacobian[2][0] = -bottom_link->getLength()*sin(upperQuat.angle() + middleQuat.angle() + lowerQuat.angle());
-    Jacobian[0][1] = top_link->getLength()*cos(upperQuat.angle()) +
-                     middle_link->getLength()*cos(upperQuat.angle() + middleQuat.angle()) +
-                     bottom_link->getLength()*cos(upperQuat.angle() + middleQuat.angle() + lowerQuat.angle());
-    Jacobian[1][1] = middle_link->getLength()*cos(upperQuat.angle() + middleQuat.angle()) +
-                     bottom_link->getLength()*cos(upperQuat.angle() + middleQuat.angle() + lowerQuat.angle());
-    Jacobian[2][1] = bottom_link->getLength()*cos(upperQuat.angle() + middleQuat.angle() + lowerQuat.angle());
+    // Position of tip relative to target
+    double deltaX = tX - x;
+    double deltaY = tY - y;
 
-    //this is the transpose of the jacobian matrix
-    double JacobianTranspose[2][3];
-    JacobianTranspose[0][0] = Jacobian[0][0];
-    JacobianTranspose[0][1] = Jacobian[1][0];
-    JacobianTranspose[0][2] = Jacobian[2][0];
-    JacobianTranspose[1][0] = Jacobian[0][1];
-    JacobianTranspose[1][1] = Jacobian[1][1];
-    JacobianTranspose[1][2] = Jacobian[2][1];
-
-    //this is the jacobian multiplied by its transpose to give a 2x2 matrix
-    double JJT[2][2];
-
-    JJT[0][0] = Jacobian[0][0]*JacobianTranspose[0][0] +
-                Jacobian[1][0]*JacobianTranspose[0][1] +
-                Jacobian[2][0]*JacobianTranspose[0][2];
-    JJT[1][0] = Jacobian[0][0]*JacobianTranspose[1][0] +
-                Jacobian[1][0]*JacobianTranspose[1][1] +
-                Jacobian[2][0]*JacobianTranspose[1][2];
-    JJT[0][1] = Jacobian[0][1]*JacobianTranspose[0][0] +
-                Jacobian[1][1]*JacobianTranspose[0][1] +
-                Jacobian[2][1]*JacobianTranspose[0][2];
-    JJT[1][1] = Jacobian[0][1]*JacobianTranspose[1][0] +
-                Jacobian[1][1]*JacobianTranspose[1][1] +
-                Jacobian[2][1]*JacobianTranspose[1][2];
-
-    //now we need the inverse of JJT
-    //to do this we need to calculate the determinant
-    double detJJT = JJT[0][0]*JJT[1][1] - JJT[0][1]*JJT[1][0];
-
-    //if the determinant is essentially zero we have a singularity
-    if(detJJT < 0.00002)
+    // If tip is close to target, move the tartget
+    double dist = sqrt(deltaX * deltaX + deltaY * deltaY);
+    if (dist < 0.1)
     {
-        cout << "determinant is zero - singularity" << endl;
-        lowerQuat *= Quaternion(J, 1/sp);
-        bottom_link->setRot(lowerQuat);
+        chooseTarget();
+        return;
     }
 
+    // Scale deltas according to distance
+    double rd = step / dist;
+    deltaX *= rd;
+    deltaY *= rd;
+
+    // Find partial derivatives
+    double dx_dpsi = - S * sin(theta + phi + psi);
+    double dx_dphi = - M * sin(theta + phi) + dx_dpsi;
+    double dx_dtht = - L * sin(theta) + dx_dphi;
+
+    double dy_dpsi = S * cos(theta + phi + psi);
+    double dy_dphi = M * cos(theta + phi) + dy_dpsi;
+    double dy_dtht = L * cos(theta) + dy_dphi;
+
+    // Set up Jacobian J
+    double j[2][3];
+    j[0][0] = dx_dtht;
+    j[0][1] = dx_dphi;
+    j[0][2] = dx_dpsi;
+    j[1][0] = dy_dtht;
+    j[1][1] = dy_dphi;
+    j[1][2] = dy_dpsi;
+
+    // Compute transposed Jacobian J^T
+    double jt[3][2];
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 2; ++c)
+            jt[r][c] = j[c][r];
+
+    // Compute product J J^T
+    double jjt[2][2];
+    for (int r = 0; r < 2; ++r)
+        for (int c = 0; c < 2; ++c)
+        {
+            jjt[r][c] = 0;
+            for (int k = 0; k < 3; ++k)
+                jjt[r][c] += j[r][k] * jt[k][c];
+        }
+
+    // Set angle increments with old values in case there is a singularity
+    double deltaTheta = oldDTheta;
+    double deltaPhi = oldDPhi;
+    double deltaPsi = oldDPsi;
+
+    // Computer determinant
+    double det = jjt[0][0] * jjt[1][1] - jjt[0][1] * jjt[1][0];
+    if (det == 0)
+    {
+        cerr << "Singularity!\n";
+    }
     else
     {
-        //otherwise we can calculate the inverse if JJT
-        double JJTinv[2][2];
-        JJTinv[0][0] = JJT[0][0]/detJJT;
-        JJTinv[0][1] = JJT[0][1]/detJJT;
-        JJTinv[1][0] = JJT[1][0]/detJJT;
-        JJTinv[1][1] = JJT[1][1]/detJJT;
+        // Determinant is non-zero, so compute inverse
+        double jjti[2][2];
+        jjti[0][0] =   jjt[1][1] / det;
+        jjti[0][1] = - jjt[0][1] / det;
+        jjti[1][0] = - jjt[1][0] / det;
+        jjti[1][1] =   jjt[0][0] / det;
 
-        //next we need the pseudoinverse which is JacobianTranspose multiples by JJTinv
-        double pseudoInv[2][3];
+        // Pseudoinverse = transpose * inverse
+        double psi[3][2];
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 2; ++c)
+            {
+                psi[r][c] = 0;
+                for (int k = 0; k < 2; ++k)
+                    psi[r][c] += jt[r][k] * jjti[k][c];
+            }
 
-        pseudoInv[0][0] = JacobianTranspose[0][0]*JJTinv[0][0] + JacobianTranspose[1][0]*JJTinv[0][1];
-        pseudoInv[1][0] = JacobianTranspose[0][0]*JJTinv[1][0] + JacobianTranspose[1][0]*JJTinv[1][1];
-        pseudoInv[0][1] = JacobianTranspose[0][1]*JJTinv[0][0] + JacobianTranspose[1][1]*JJTinv[0][1];
-        pseudoInv[1][1] = JacobianTranspose[0][1]*JJTinv[1][0] + JacobianTranspose[1][1]*JJTinv[1][1];
-        pseudoInv[0][2] = JacobianTranspose[0][2]*JJTinv[0][0] + JacobianTranspose[1][2]*JJTinv[0][1];
-        pseudoInv[1][2] = JacobianTranspose[0][2]*JJTinv[1][0] + JacobianTranspose[1][2]*JJTinv[1][1];
+        // Obtain angle increments from pseudo-inverse
+        deltaTheta = psi[0][0] * deltaX + psi[0][1] * deltaY;
+        deltaPhi =   psi[1][0] * deltaX + psi[1][1] * deltaY;
+        deltaPsi =   psi[2][0] * deltaX + psi[2][1] * deltaY;
 
-        //now we can use this to compute the change in angle based on the change in x and y which is just the speed
-        //calculate the current position of the tip
-        curr_x = top_link->getLength()*cos(upperQuat.angle()) + middle_link->getLength()*cos(upperQuat.angle() + middleQuat.angle()) + bottom_link->getLength()*cos(upperQuat.angle() + middleQuat.angle() + lowerQuat.angle());
-        curr_y = top_link->getLength()*sin(upperQuat.angle()) + middle_link->getLength()*sin(upperQuat.angle() + middleQuat.angle()) + bottom_link->getLength()*sin(upperQuat.angle() + middleQuat.angle() + lowerQuat.angle());
-
-        //now we take the difference between the final x and the curr x and the same for the y. if the difference is negative
-        //then delta_x should be negative, otherwise it should be positive
-        double delta_x = 0;
-        double delta_y = 0;
-
-        if((final_x - curr_x) < 0)
-            delta_x = -sp;
-        else
-            delta_x = sp;
-
-        if((final_y - curr_y) < 0)
-            delta_y = -sp;
-        else
-            delta_y = sp;
-
-        //now we need to multiply the vector containing delta_x and delta_y to have  the change in angle to apply to each
-        double angle_changes[3];
-
-        angle_changes[0] = pseudoInv[0][0]*delta_x + pseudoInv[1][0]*delta_y;
-        angle_changes[1] = pseudoInv[0][1]*delta_x + pseudoInv[1][1]*delta_y;
-        angle_changes[2] = pseudoInv[0][2]*delta_x + pseudoInv[1][2]*delta_y;
-
-        upperQuat *= Quaternion(J, angle_changes[0]);
-        top_link->setRot(upperQuat);
-        middleQuat *= Quaternion(J, angle_changes[1]);
-        middle_link->setRot(middleQuat);
-        lowerQuat *= Quaternion(J, angle_changes[2]);
-        bottom_link->setRot(lowerQuat);
-
-        upperQuat.normalize();
-        middleQuat.normalize();
-        lowerQuat.normalize();
-
-        glutPostRedisplay();
+        // Save increments in case we need them
+        oldDTheta = deltaTheta;
+        oldDPhi = deltaPhi;
+        oldDPsi = deltaPsi;
     }
 
+    // Update angles and arm positions
+    theta += deltaTheta;
+    upper->setRot(theta);
+
+    phi += deltaPhi;
+    middle->setRot(phi);
+
+    psi += deltaPsi;
+    lower->setRot(psi);
+
+    glutPostRedisplay();
 }
 
 void keyboard (unsigned char key, int x, int y)
 {
     switch (key)
     {
+        case '+':
+            step *= 1.1;
+            break;
+        case '-':
+            step /= 1.1;
+            break;
         case 'f':
             glutFullScreen();
             break;
-        case 27:
+        case 't':
+            chooseTarget();
+            break;
         case 'q':
+        case 27:
             exit(0);
             break;
     }
@@ -285,13 +299,18 @@ void reshape (int w, int h)
 int main(int argc, char *argv[])
 {
     cout <<
-         "f  full screen\n"
-         "ESC  quit\n";
+         "Pseudoinverse demonstration\n\n"
+         " +   faster\n"
+         " -   slower\n"
+         " t   choose new target\n"
+         " f   full screen\n"
+         " q   quit\n"
+         "ESC  quiit\n";
     glutInit(&argc, argv);
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_DEPTH);
     glutInitWindowSize(windowWidth, windowHeight);
-    glutInitWindowPosition(0, 0);
-    glutCreateWindow("Forward Kinematics");
+    glutInitWindowPosition(300, 300);
+    glutCreateWindow("Inverse Kinematics using the Pseudoinverse");
     glutDisplayFunc(display);
     glutKeyboardFunc(keyboard);
     glutReshapeFunc(reshape);
@@ -302,7 +321,7 @@ int main(int argc, char *argv[])
     glLightfv(GL_LIGHT0, GL_POSITION, dir);
     glMaterialfv(GL_FRONT, GL_SPECULAR, white);
     glMaterialfv(GL_FRONT, GL_SHININESS, shiny);
-    build();
+    initialize();
     glutMainLoop();
     return 0;
 }
